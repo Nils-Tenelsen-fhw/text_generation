@@ -1,3 +1,4 @@
+#Script used to load models of the rnn in test.py, generates a handful of test outputs.
 import tensorflow as tf
 
 import numpy as np
@@ -5,7 +6,7 @@ import os
 import time
 from tensorflow.keras import backend
 
-one_step_reloaded = tf.saved_model.load('100_epochs_model')
+one_step_reloaded = tf.saved_model.load('test_with_all_mails_drive_20_model_v2')
 
 def get_output(input):
     states = None
