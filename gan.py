@@ -119,7 +119,7 @@ seed = tf.random.normal([num_examples_to_generate, noise_dim])
 
 # Notice the use of `tf.function`
 # This annotation causes the function to be "compiled".
-@tf.function
+#@tf.function
 def train_step(images):
     noise = tf.random.normal([BATCH_SIZE, noise_dim])
 

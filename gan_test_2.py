@@ -1,12 +1,10 @@
-#from https://www.tensorflow.org/text/tutorials/text_generation
-
 import tensorflow as tf
 
 import numpy as np
+import sys
 import os
 import time
 from tensorflow.keras import backend
-from tensorflow.keras import layers
 
 start_time = time.time()
 
@@ -18,13 +16,15 @@ print(tf.config.list_physical_devices())
 print(tf.config.list_physical_devices('GPU'))
 #tf.debugging.set_log_device_placement(True)
 physical_devices = tf.config.list_physical_devices('GPU')
-#tf.config.experimental.set_memory_growth(physical_devices[0], enable=True)
+tf.config.experimental.set_memory_growth(physical_devices[0], enable=True)
+
+#tf.config.run_functions_eagerly(True)
+#tf.compat.v1.disable_eager_execution()
 
 #------------------------------------
 #------------------------------------
 
-fullPath = os.path.abspath("./" + 'all_mails_3.csv')
-output_path = 'test_with_all_mails_200_model_32_batch_acc_metric_learning_00005_try2_v3'
+fullPath = os.path.abspath("./" + 'input.txt')
 #path_to_file = tf.keras.utils.get_file('private-phishing4.txt', 'file://' + fullPath)
 
 # Read, then decode for py2 compat.
@@ -37,7 +37,9 @@ print(text[:250])
 vocab = sorted(set(text))
 print(f'{len(vocab)} unique characters')
 
-example_texts = ['abcdefg', 'xyz']
+
+
+example_texts = ['abcdefg', 'xyzxyzx']
 
 chars = tf.strings.unicode_split(example_texts, input_encoding='UTF-8')
 print(chars)
@@ -92,7 +94,7 @@ for input_example, target_example in dataset.take(1):
     print("Target:", text_from_ids(target_example).numpy())
 
 # Batch size
-BATCH_SIZE = 32
+BATCH_SIZE = 64
 
 # Buffer size to shuffle the dataset
 # (TF data is designed to work with possibly infinite sequences,
@@ -117,14 +119,23 @@ rnn_units = 1024
 
 print(tf.config.list_physical_devices())
 
+discriminator = tf.keras.Sequential([
+  tf.keras.layers.Embedding(vocab_size, embedding_dim),
+  tf.keras.layers.Dropout(0.2),
+  #tf.keras.layers.GlobalAveragePooling1D(),
+  tf.keras.layers.Dropout(0.2),
+  tf.keras.layers.Dense(1)])
 
-class RNN_Model(tf.keras.Model):
+discriminator.summary()#discriminator(ids_from_chars(tf.strings.unicode_split('Dear Customer we are\n', 'UTF-8')))
+
+class GeneratorModel(tf.keras.Model):
   def __init__(self, vocab_size, embedding_dim, rnn_units):
     super().__init__(self)
     self.embedding = tf.keras.layers.Embedding(vocab_size, embedding_dim)
     self.gru = tf.keras.layers.GRU(rnn_units,
                                    return_sequences=True,
-                                   return_state=True)
+                                   return_state=True,
+                                   stateful=False)
     self.dense = tf.keras.layers.Dense(vocab_size)
 
   def call(self, inputs, states=None, return_state=False, training=False):
@@ -140,16 +151,16 @@ class RNN_Model(tf.keras.Model):
     else:
       return x
 
-model = RNN_Model(
+generator = GeneratorModel(
     vocab_size=vocab_size,
     embedding_dim=embedding_dim,
     rnn_units=rnn_units)
 
 for input_example_batch, target_example_batch in dataset.take(1):
-    example_batch_predictions = model(input_example_batch)
+    example_batch_predictions = generator(input_example_batch)
     print(example_batch_predictions.shape, "# (batch_size, sequence_length, vocab_size)")
 
-model.summary()
+generator.summary()
 
 sampled_indices = tf.random.categorical(example_batch_predictions[0], num_samples=1)
 sampled_indices = tf.squeeze(sampled_indices, axis=-1).numpy()
@@ -160,7 +171,26 @@ print("Input:\n", text_from_ids(input_example_batch[0]).numpy())
 print()
 print("Next Char Predictions:\n", text_from_ids(sampled_indices).numpy())
 
-loss = tf.losses.SparseCategoricalCrossentropy(from_logits=True)
+loss = tf.losses.SparseCategoricalCrossentropy(from_logits=True, reduction=tf.keras.losses.Reduction.NONE)
+
+#cross_entropy = loss
+# This method returns a helper function to compute cross entropy loss
+cross_entropy = tf.keras.losses.BinaryCrossentropy(from_logits=True)
+#cross_entropy = tf.losses.SparseCategoricalCrossentropy(from_logits=True)
+
+def discriminator_loss(real_output, fake_output):
+    real_loss = cross_entropy(tf.ones_like(real_output), real_output)
+    fake_loss = cross_entropy(tf.zeros_like(fake_output), fake_output)
+    total_loss = real_loss + fake_loss
+    return total_loss
+
+def generator_loss(fake_output):
+    return cross_entropy(tf.ones_like(fake_output), fake_output)
+
+generator_optimizer = tf.keras.optimizers.Adam()
+discriminator_optimizer = tf.keras.optimizers.Adam()
+
+
 
 example_batch_mean_loss = loss(target_example_batch, example_batch_predictions)
 print("Prediction shape: ", example_batch_predictions.shape, " # (batch_size, sequence_length, vocab_size)")
@@ -168,22 +198,65 @@ print("Mean loss:        ", example_batch_mean_loss)
 
 tf.exp(example_batch_mean_loss).numpy()
 
-#model.compile(optimizer='adam', loss=loss, metrics=['accuracy'])
-model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.00005), loss=loss, metrics=['accuracy'])
+#generator.compile(optimizer='adam', loss=loss)
 
-# Directory where the checkpoints will be saved
-checkpoint_dir = './training_checkpoints/' + output_path
-# Name of the checkpoint files
-checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt_{epoch}")
+checkpoint_dir = './training_checkpoints'
+checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt")
+checkpoint = tf.train.Checkpoint(generator_optimizer=generator_optimizer,
+                                 discriminator_optimizer=discriminator_optimizer,
+                                 generator=generator,
+                                 discriminator=discriminator)
+
 
 checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
     filepath=checkpoint_prefix,
     save_weights_only=True)
 
-EPOCHS = 200
+EPOCHS = 10
 
-history = model.fit(dataset, epochs=EPOCHS, callbacks=[checkpoint_callback])
+num_examples_to_generate = 16
 
+#wrapper for categorical sampling
+def categorical_sampling(t):
+    return tf.cast(tf.random.categorical(t, num_samples=1), dtype=tf.float32)
+
+test_loss = tf.losses.SparseCategoricalCrossentropy(from_logits=True, reduction=tf.keras.losses.Reduction.NONE)
+
+#@tf.function
+def train_step(gen_model, disc_model, inputs):
+  inputs, labels = inputs
+  with tf.GradientTape() as gen_tape, tf.GradientTape() as disc_tape:
+      predictions = gen_model(inputs, training=True)
+      real_discriminated = disc_model(labels, training=True)
+      fake_discriminated = disc_model(predictions, training=True)
+      gen_loss = generator_loss(fake_discriminated)
+
+  gen_grads = gen_tape.gradient(gen_loss, gen_model.trainable_variables)
+  disc_grads = disc_tape.gradient(gen_loss, disc_model.trainable_variables)
+  generator_optimizer.apply_gradients(zip(gen_grads, gen_model.trainable_variables))
+  discriminator_optimizer.apply_gradients(zip(disc_grads, disc_model.trainable_variables))
+
+  return {'loss': loss}
+
+
+
+def train(dataset, epochs):
+  for epoch in range(epochs):
+    start = time.time()
+
+    for batch in dataset:
+      #print(batch)
+      train_step(generator, discriminator, batch)
+
+
+    # Save the model every 5 epochs
+    if (epoch + 1) % 15 == 0:
+      checkpoint.save(file_prefix = checkpoint_prefix)
+
+    print ('Time for epoch {} is {} sec'.format(epoch + 1, time.time()-start))
+
+train(dataset, EPOCHS)
+#history = generator.fit(dataset, epochs=EPOCHS, callbacks=[checkpoint_callback])
 
 class OneStep(tf.keras.Model):
   def __init__(self, model, chars_from_ids, ids_from_chars, temperature=1.0):
@@ -229,7 +302,7 @@ class OneStep(tf.keras.Model):
     # Return the characters and model state.
     return predicted_chars, states
 
-one_step_model = OneStep(model, chars_from_ids, ids_from_chars)
+one_step_model = OneStep(generator, chars_from_ids, ids_from_chars)
 
 start = time.time()
 states = None
@@ -259,8 +332,8 @@ end = time.time()
 print(result, '\n\n' + '_'*80)
 print('\nRun time:', end - start)
 
-tf.saved_model.save(one_step_model, output_path)
-one_step_reloaded = tf.saved_model.load(output_path)
+tf.saved_model.save(one_step_model, 'test_with_all_mails_10_gan_tv1_model_v3')
+one_step_reloaded = tf.saved_model.load('test_with_all_mails_10_tv1_model_v3')
 
 states = None
 next_char = tf.constant(['Dear '])
